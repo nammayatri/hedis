@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# OPTIONS_GHC -Wwarn=incomplete-uni-patterns #-}
 
 -- |A module for automatic, optimal protocol pipelining.
 --

@@ -26,6 +26,7 @@ import qualified Data.IORef as IOR
 import Data.Maybe(mapMaybe, fromMaybe)
 import Data.List(nub, sortBy, find)
 import Data.Map(fromListWith, assocs)
+import Data.Foldable (foldrM)
 import Data.Function(on)
 import Control.Exception(Exception, SomeException, throwIO, BlockedIndefinitelyOnMVar(..), catches, Handler(..), try, fromException)
 import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar, modifyMVar_)
@@ -96,7 +97,7 @@ data NodeRole = Master | Slave deriving (Show, Eq, Ord)
 type Host = String
 type Port = Int
 type NodeID = B.ByteString
--- Represents a single node, note that this type does not include the 
+-- Represents a single node, note that this type does not include the
 -- connection to the node because the shard map can be shared amongst multiple
 -- connections
 data Node = Node NodeID NodeRole Host Port deriving (Show, Eq, Ord)
@@ -263,17 +264,22 @@ evaluatePipeline shardMapVar refreshShardmapAction conn requests = do
         -- throwing exception for timeouts thus closing the connection instead of retrying.
         -- otherwise if there is any response in the connection buffer it'll get forwarded to other requests that are reusing the same connection.
         -- leading to jumbled up responses
-        resps <- concat <$>
-          mapM (\(resp, (cc, r)) -> case resp of
-              Right v -> return v
+        (anyMoved, retryRequired, resps) <-
+          foldrM (\(resp, (cc, r)) (am, rr, acc) -> case resp of
+              Right v -> return (am || (any (moved . rawResponse) v), rr, v ++ acc)
               Left (err :: SomeException) ->
                 case fromException err of
                   Just (er :: TimeoutException) -> throwIO er
-                  _ -> executeRequests (getRandomConnection cc conn) r
-            ) (zip eresps requestsByNode)
+                  _ -> do
+                    newResp <- executeRequests (getRandomConnection cc conn) r
+                    return $ (am || any (moved . rawResponse) newResp, True, newResp ++ acc))
+                (False, False, [])
+                (zip eresps requestsByNode)
         -- check for any moved in both responses and continue the flow.
-        when (any (moved . rawResponse) resps) refreshShardMapVar
-        retriedResps <- mapM (retry 0) resps
+        when (anyMoved) refreshShardMapVar
+        retriedResps <- if retryRequired
+                           then mapM (retry 0) resps
+                           else return resps
         return $ map rawResponse $ sortBy (on compare responseIndex) retriedResps
   where
     getRequestsByNode :: ShardMap -> IO [(NodeConnection, [PendingRequest])]
@@ -454,7 +460,7 @@ allMasterNodes (Connection nodeConns _ _ _ _) (ShardMap shardMap) =
 requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
 requestNode (NodeConnection ctx lastRecvRef _) requests = do
     envTimeout <- round . (\x -> (x :: Time.NominalDiffTime) * 1000000) . realToFrac . fromMaybe (5.0 :: Double) . (>>= readMaybe) <$> lookupEnv "REDIS_REQUEST_NODE_TIMEOUT"
-    eresp <- timeout envTimeout requestNodeImpl 
+    eresp <- timeout envTimeout requestNodeImpl
     case eresp of
       Just e -> return e
       Nothing -> putStrLn "timeout happened" *> throwIO (TimeoutException "Request Timeout")

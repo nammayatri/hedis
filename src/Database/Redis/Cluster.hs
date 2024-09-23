@@ -30,7 +30,8 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.IORef as IOR
 import Data.Maybe(mapMaybe, fromMaybe)
-import Data.List(nub, sortBy, find)
+import Data.List(sortBy, find)
+import Data.List.Extra (nubOrd)
 import Data.Map(fromListWith, assocs)
 import Data.Function(on)
 import Control.Exception(Exception, SomeException, throwIO, BlockedIndefinitelyOnMVar(..), catches, Handler(..), try, fromException)
@@ -152,7 +153,7 @@ createClusterConnectionPools withAuth maxResources idleTime commandInfos shardMa
         return $ Connection shardNodeVar (CMD.newInfoMap commandInfos) clusterConfig where
     nodeConnections :: IO (HM.HashMap NodeID NodeConnection)
     nodeConnections = do
-      nodeConnectionsList <- mapM (createNodePool withAuth maxResources idleTime) (nub $ nodes shardMap)
+      nodeConnectionsList <- mapM (createNodePool withAuth maxResources idleTime) (nubOrd $ nodes shardMap)
       return $ HM.fromList nodeConnectionsList
 
 createNodePool :: (Host -> CC.PortID -> IO CC.ConnectionContext) -> Int -> Time.NominalDiffTime -> Node -> IO (NodeID, NodeConnection)
@@ -273,7 +274,7 @@ evaluatePipeline refreshShardmapAction conn@(Connection shardNodeVar infoMap _) 
                 refreshedShardMapAndNodeConnsIORef <- IOR.newIORef Nothing
                 mapM (\completedRequest@(CompletedRequest index request response) -> 
                     case response of
-                        (Error errString) | B.isPrefixOf "MOVED" errString -> CompletedRequest index request <$> refreshShardMapAndRetryRequest refreshedShardMapAndNodeConnsIORef (hasLocked $ refreshShardmapAction (Just nc)) request
+                        (Error errString) | (B.isPrefixOf "MOVED" errString || B.isPrefixOf "TRYAGAIN" errString) -> CompletedRequest index request <$> refreshShardMapAndRetryRequest refreshedShardMapAndNodeConnsIORef (hasLocked $ refreshShardmapAction (Just nc)) request
                         (askingRedirection -> Just (host, port)) -> do 
                                 refreshedShardMapAndNodeConns <- fromMaybeM (hasLocked $ refreshShardmapAction (Just nc)) $ IOR.readIORef refreshedShardMapAndNodeConnsIORef
                                 maybeAskNode <- nodeConnWithHostAndPort refreshedShardMapAndNodeConns host port
@@ -395,7 +396,7 @@ nodeConnForHashSlot (ShardMap shardMap, nodeConnsMap) errInfo hashSlot = do
 
 hashSlotForKeys :: Exception e => e -> [B.ByteString] -> IO HashSlot
 hashSlotForKeys exception keys =
-    case nub (keyToSlot <$> keys) of
+    case nubOrd (keyToSlot <$> keys) of
         -- If none of the commands contain a key we can send them to any
         -- node. Let's pick the first one.
         [] -> return 0
@@ -453,9 +454,9 @@ nodeConnectionForCommand (ShardMap shardMap) nodeConns infoMap request =
 
 allMasterNodes :: ShardMap -> NodeConnectionMap -> IO (Maybe [NodeConnection])
 allMasterNodes (ShardMap shardMap) nodeConns = do
-    return $ mapM (flip HM.lookup nodeConns . nodeId) onlyMasterNodes
+    return $ mapM (flip HM.lookup nodeConns) onlyMasterNodeIds
   where
-    onlyMasterNodes = (\(Shard master _) -> master) <$> nub (IntMap.elems shardMap)
+    onlyMasterNodeIds = nubOrd $ (\(Shard master _) -> nodeId master) <$> (IntMap.elems shardMap)
 
 requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
 requestNode (NodeConnection pool _) requests = withResource pool $ \(ctx, lastRecvRef) -> do
@@ -514,9 +515,8 @@ requestMasterNodes conn req = do
 masterNodes :: Connection -> IO [NodeConnection]
 masterNodes (Connection shardNodeVar _ _) = do
     (ShardMap shardMap, nodeConns) <- hasLocked $ readMVar shardNodeVar
-    let masters = map ((\(Shard m _) -> m) . snd) $ IntMap.toList shardMap
-    let masterNodeIds = map nodeId masters
-    return $ mapMaybe (`HM.lookup` nodeConns) masterNodeIds
+    let masterNodeIds = map (\(Shard m _) -> nodeId m) $ IntMap.elems shardMap
+    return $ mapMaybe (`HM.lookup` nodeConns) (nubOrd masterNodeIds)
 
 getRandomConnection :: NodeConnection -> Connection -> IO NodeConnection
 getRandomConnection nc conn = do

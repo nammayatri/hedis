@@ -258,22 +258,32 @@ connectWithAuth ConnInfo{connectTLSParams,connectAuth,connectReadOnly,connectTim
 clusterConnectTimeoutinUs :: Time.NominalDiffTime -> Int
 clusterConnectTimeoutinUs = round . (1000000 *) 
 
+testfn :: IO (HM.HashMap String String)
+testfn = do
+    td <- lookupEnv "REDIS_SUBNET_MAP"
+    print td
+    subnetMap :: HM.HashMap String String <- fromMaybe HM.empty . (>>= readMaybe) <$> lookupEnv "REDIS_SUBNET_MAP"
+    return subnetMap
+
 shardMapFromClusterSlotsResponse :: ClusterSlotsResponse -> IO ShardMap
-shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = ShardMap <$> foldr mkShardMap (pure IntMap.empty)  clusterSlotsResponseEntries where
-    mkShardMap :: ClusterSlotsResponseEntry -> IO (IntMap.IntMap Shard) -> IO (IntMap.IntMap Shard)
-    mkShardMap ClusterSlotsResponseEntry{..} accumulator = do
+shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = do
+    subnetMap :: HM.HashMap String String <- fromMaybe HM.empty . (>>= readMaybe) <$> lookupEnv "REDIS_SUBNET_MAP"
+    ShardMap <$> foldr (mkShardMap subnetMap) (pure IntMap.empty)  clusterSlotsResponseEntries where
+    mkShardMap :: HM.HashMap String String -> ClusterSlotsResponseEntry -> IO (IntMap.IntMap Shard) -> IO (IntMap.IntMap Shard)
+    mkShardMap subnetMap ClusterSlotsResponseEntry{..} accumulator = do
         accumulated <- accumulator
-        let master = nodeFromClusterSlotNode True clusterSlotsResponseEntryMaster
-        -- let replicas = map (nodeFromClusterSlotNode False) clusterSlotsResponseEntryReplicas
-        let shard = Shard master []
+        let master = nodeFromClusterSlotNode True subnetMap clusterSlotsResponseEntryMaster
+        let replicas = map (nodeFromClusterSlotNode False subnetMap) clusterSlotsResponseEntryReplicas
+        let shard = Shard master replicas
         let slotMap = IntMap.fromList $ map (, shard) [clusterSlotsResponseEntryStartSlot..clusterSlotsResponseEntryEndSlot]
         return $ IntMap.union slotMap accumulated
-    nodeFromClusterSlotNode :: Bool -> ClusterSlotsNode -> Node
-    nodeFromClusterSlotNode isMaster ClusterSlotsNode{..} =
+    nodeFromClusterSlotNode :: Bool -> HM.HashMap String String -> ClusterSlotsNode -> Node
+    nodeFromClusterSlotNode isMaster subnetMap ClusterSlotsNode{..} =
         let hostname = Char8.unpack clusterSlotsNodeIP
             role = if isMaster then Cluster.Master else Cluster.Slave
+            zone = Cluster.getZoneInfoFromSubnet subnetMap hostname
         in
-            Cluster.Node clusterSlotsNodeID role hostname (toEnum clusterSlotsNodePort)
+            Cluster.Node clusterSlotsNodeID role hostname (toEnum clusterSlotsNodePort) zone
 
 refreshShardMap :: ConnectInfo -> Cluster.Connection -> Maybe Cluster.NodeConnection -> IO (ShardMap, NodeConnectionMap)
 refreshShardMap connectInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} (Cluster.Connection shardNodeVar _ _) nodeConn = do
@@ -286,7 +296,7 @@ refreshShardMap connectInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} (
         withAuth = connectWithAuth connectInfo
         updateNodeConnections :: ShardMap -> HM.HashMap Cluster.NodeID Cluster.NodeConnection -> IO (HM.HashMap Cluster.NodeID Cluster.NodeConnection)
         updateNodeConnections newShardMap oldNodeConnMap = do
-            foldM (\acc node@(Cluster.Node nodeid _ _ _) -> 
+            foldM (\acc node@(Cluster.Node nodeid _ _ _ _zone) -> 
                 case HM.lookup nodeid oldNodeConnMap of
                     Just nodeconn -> return $ HM.insert nodeid nodeconn acc
                     Nothing       -> do

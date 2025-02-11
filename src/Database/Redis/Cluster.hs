@@ -21,6 +21,7 @@ module Database.Redis.Cluster
   , NodeID
   , Pipeline(..)
   , PipelineState(..)
+  , ClusterConfig(..)
   , createClusterConnectionPools
   , destroyNodeResources
   , requestPipelined

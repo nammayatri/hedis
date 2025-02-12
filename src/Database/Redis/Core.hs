@@ -26,7 +26,6 @@ import Database.Redis.Types
 import Database.Redis.Cluster(ShardMap, NodeConnectionMap, NodeConnection)
 import qualified Database.Redis.Cluster as Cluster
 import System.Environment (lookupEnv)
-import Text.Read (readMaybe)
 
 --------------------------------------------------------------------------------
 -- The Redis Monad

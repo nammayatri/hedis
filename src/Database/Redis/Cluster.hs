@@ -135,26 +135,29 @@ type NodeConnectionMap = HM.HashMap NodeID NodeConnection
 
 -- Object for storing connection Info which will be used when cluster is refreshed
 data ClusterConfig = ClusterConfig
-    { 
-        requestTimeout  :: Maybe Int,
-        useMasterOnly   :: Maybe Bool
-    } deriving Show
-
-
+  { requestTimeout :: Maybe Int,
+    useMasterOnly :: Maybe Bool
+  }
+  deriving (Show)
 
 newtype MissingNodeException = MissingNodeException [B.ByteString] deriving (Show, Typeable)
+
 instance Exception MissingNodeException
 
 newtype UnsupportedClusterCommandException = UnsupportedClusterCommandException [B.ByteString] deriving (Show, Typeable)
+
 instance Exception UnsupportedClusterCommandException
 
 newtype CrossSlotException = CrossSlotException [[B.ByteString]] deriving (Show, Typeable)
+
 instance Exception CrossSlotException
 
-data NoNodeException = NoNodeException  deriving (Show, Typeable)
+data NoNodeException = NoNodeException deriving (Show, Typeable)
+
 instance Exception NoNodeException
 
 data TimeoutException = TimeoutException String deriving (Show, Typeable)
+
 instance Exception TimeoutException
 
 -- format: `127.0.0.0/24`
@@ -167,54 +170,56 @@ safeTail txt = Just $ T.tail txt
 
 ipToInt :: [Word32] -> Maybe Word32
 ipToInt ip =
-    if length ip /= 4
-        then Nothing
-        else do
-            Just $ foldl' (\acc x -> (acc `shiftL` 8) + x) (0 :: Word32) ip
+  if length ip /= 4
+    then Nothing
+    else do
+      Just $ foldl' (\acc x -> (acc `shiftL` 8) + x) (0 :: Word32) ip
 
 readMaybeWord8 :: T.Text -> Maybe Word32
 readMaybeWord8 txt = case T.decimal txt of
-    Right (res, "") | res <= 255 -> Just res
-    _ -> Nothing
+  Right (res, "") | res <= 255 -> Just res
+  _ -> Nothing
 
 extractIPv4 :: T.Text -> Maybe [Word32]
 extractIPv4 ipStr = do
-    ip <- mapM readMaybeWord8 $ T.splitOn "." ipStr
-    bool Nothing (Just ip) (length ip == 4)
+  ip <- mapM readMaybeWord8 $ T.splitOn "." ipStr
+  bool Nothing (Just ip) (length ip == 4)
 
 toIPv4Subnet :: T.Text -> Maybe IPv4Subnet
 toIPv4Subnet subnetIPWithMask = do
-    let (subnetIPstr, maskStr) = T.breakOn "/" subnetIPWithMask
-    mask <- readMaybeWord8 =<< safeTail maskStr
-    subnetIP <- extractIPv4 subnetIPstr
-    Just $ IPv4Subnet subnetIP mask
+  let (subnetIPstr, maskStr) = T.breakOn "/" subnetIPWithMask
+  mask <- readMaybeWord8 =<< safeTail maskStr
+  subnetIP <- extractIPv4 subnetIPstr
+  Just $ IPv4Subnet subnetIP mask
 
 isIPinSubnet :: Host -> T.Text -> Bool
-isIPinSubnet nodeIP subnetStr = 
-    maybe False (\(low, up, ip) -> low <= ip && ip <= up) $ do
-        (IPv4Subnet subnetIP mask) <- toIPv4Subnet subnetStr
-        lowerBound <- ipToInt subnetIP
-        let upperBound = lowerBound + (2^(32-mask)-1)
-        ip <- ipToInt =<< extractIPv4 (T.pack nodeIP)
-        return (lowerBound, upperBound, ip)
+isIPinSubnet nodeIP subnetStr =
+  maybe False (\(low, up, ip) -> low <= ip && ip <= up) $ do
+    (IPv4Subnet subnetIP mask) <- toIPv4Subnet subnetStr
+    lowerBound <- ipToInt subnetIP
+    let upperBound = lowerBound + (2 ^ (32 - mask) - 1)
+    ip <- ipToInt =<< extractIPv4 (T.pack nodeIP)
+    return (lowerBound, upperBound, ip)
 
 getZoneInfoFromSubnet :: HM.HashMap String String -> Host -> Zone
 getZoneInfoFromSubnet ipSubnetToZoneMap ip = do
-    let subnets = filter (isIPinSubnet ip . T.pack . fst) $ HM.toList ipSubnetToZoneMap
-    case subnets of
-        [(_ , zone)] -> return zone
-        _ -> Nothing
+  let subnets = filter (isIPinSubnet ip . T.pack . fst) $ HM.toList ipSubnetToZoneMap
+  case subnets of
+    [(_, zone)] -> return zone
+    _ -> Nothing
 
 createClusterConnectionPools :: (Host -> CC.PortID -> IO CC.ConnectionContext) -> Int -> Time.NominalDiffTime -> [CMD.CommandInfo] -> ShardMap -> IO Connection
-createClusterConnectionPools withAuth maxResources idleTime commandInfos shardMap  = do
-        nodeConns <- nodeConnections
-        shardNodeVar <- newMVar (shardMap, nodeConns)
-        nodeRequestTimeout <- (>>= readMaybe) <$> lookupEnv "REDIS_REQUEST_NODE_TIMEOUT"
-        let clusterConfig = ClusterConfig {
-                    requestTimeout = nodeRequestTimeout,
-                    useMasterOnly = Nothing 
-                }
-        return $ Connection shardNodeVar (CMD.newInfoMap commandInfos) clusterConfig where
+createClusterConnectionPools withAuth maxResources idleTime commandInfos shardMap = do
+  nodeConns <- nodeConnections
+  shardNodeVar <- newMVar (shardMap, nodeConns)
+  nodeRequestTimeout <- (>>= readMaybe) <$> lookupEnv "REDIS_REQUEST_NODE_TIMEOUT"
+  let clusterConfig =
+        ClusterConfig
+          { requestTimeout = nodeRequestTimeout,
+            useMasterOnly = Nothing
+          }
+  return $ Connection shardNodeVar (CMD.newInfoMap commandInfos) clusterConfig
+  where
     nodeConnections :: IO (HM.HashMap NodeID NodeConnection)
     nodeConnections = do
       nodeConnectionsList <- mapM (createNodePool withAuth maxResources idleTime) (nubOrd $ nodes shardMap)
@@ -285,10 +290,11 @@ isExec ("EXEC" : _) = True
 isExec _ = False
 
 data PendingRequest = PendingRequest Int [B.ByteString]
+
 data CompletedRequest = CompletedRequest Int [B.ByteString] Reply
 
 rawRequest :: PendingRequest -> [B.ByteString]
-rawRequest (PendingRequest _ r) =  r
+rawRequest (PendingRequest _ r) = r
 
 responseIndex :: CompletedRequest -> Int
 responseIndex (CompletedRequest i _ _) = i
@@ -353,24 +359,25 @@ evaluatePipeline refreshShardmapAction conn@(Connection shardNodeVar infoMap _) 
   where
     getRequestsByNode :: ShardMap -> NodeConnectionMap -> IO [(NodeConnection, [PendingRequest])]
     getRequestsByNode shardMap nodeConnMap = do
-        commandsWithNodes <- zipWithM (requestWithNodes shardMap nodeConnMap) (reverse [0..(length requests - 1)]) requests
-        return $ assocs $ fromListWith (++) (mconcat commandsWithNodes)
+      commandsWithNodes <- zipWithM (requestWithNodes shardMap nodeConnMap) (reverse [0 .. (length requests - 1)]) requests
+      return $ assocs $ fromListWith (++) (mconcat commandsWithNodes)
     requestWithNodes :: ShardMap -> NodeConnectionMap -> Int -> [B.ByteString] -> IO [(NodeConnection, [PendingRequest])]
     requestWithNodes shardMap nodeConnMap index request = do
-        nodeConns <- nodeConnectionForCommand shardMap nodeConnMap infoMap request podZone useMasterOnly
-        return $ (, [PendingRequest index request]) <$> nodeConns
+      nodeConns <- nodeConnectionForCommand shardMap nodeConnMap infoMap request podZone useMasterOnly
+      return $ (,[PendingRequest index request]) <$> nodeConns
     executeRequests :: NodeConnection -> [PendingRequest] -> IO [CompletedRequest]
     executeRequests nodeConn nodeRequests = do
-        replies <- requestNode nodeConn $ map rawRequest nodeRequests
-        return $ zipWith (curry (\(PendingRequest i r, rep) -> CompletedRequest i r rep)) nodeRequests replies
+      replies <- requestNode nodeConn $ map rawRequest nodeRequests
+      return $ zipWith (curry (\(PendingRequest i r, rep) -> CompletedRequest i r rep)) nodeRequests replies
     refreshShardMapAndRetryRequest :: IOR.IORef (Maybe (ShardMap, NodeConnectionMap)) -> IO (ShardMap, NodeConnectionMap) -> [B.ByteString] -> IO Reply
-    refreshShardMapAndRetryRequest refreshedShardMapAndNodeConnsIORef refreshShardmap request =  do 
-        (newShardMap, newNodeConn) <- fromMaybeM (hasLocked refreshShardmap >>= (\new -> IOR.writeIORef refreshedShardMapAndNodeConnsIORef (Just new) >> return new )) $ 
-                                        IOR.readIORef refreshedShardMapAndNodeConnsIORef
-        nodeConns <- nodeConnectionForCommand newShardMap newNodeConn infoMap request podZone useMasterOnly
-        head <$> requestNode (head nodeConns) [request]
+    refreshShardMapAndRetryRequest refreshedShardMapAndNodeConnsIORef refreshShardmap request = do
+      (newShardMap, newNodeConn) <-
+        fromMaybeM (hasLocked refreshShardmap >>= (\new -> IOR.writeIORef refreshedShardMapAndNodeConnsIORef (Just new) >> return new)) $
+          IOR.readIORef refreshedShardMapAndNodeConnsIORef
+      nodeConns <- nodeConnectionForCommand newShardMap newNodeConn infoMap request podZone useMasterOnly
+      head <$> requestNode (head nodeConns) [request]
 
---fix multi exec
+-- fix multi exec
 -- Like `evaluateOnPipeline`, except we expect to be able to run all commands
 -- on a single shard. Failing to meet this expectation is an error.
 -- Note: This function is not suitable for zone-aware replica node usage, as it may include both SET and GET commands within the same transaction.
@@ -519,66 +526,81 @@ nodeConnectionForCommand (ShardMap shardMap) nodeConns infoMap request podZone u
                 Just allNodes' -> return allNodes'
 
 redisReadCommands :: [B.ByteString]
-redisReadCommands = ["GET","MGET"]
+redisReadCommands =
+  [ "GET",
+    "MGET",
+    "XREAD",
+    "SMEMBERS",
+    "SISMEMBER",
+    "ZRANGE",
+    "ZRANGEBYSCORE",
+    "ZREVRANGEBYSCORE",
+    "XREVRANGE",
+    "ZCARD",
+    "ZSCORE",
+    "HGET",
+    "HMGET",
+    "HGETALL",
+    "LRANGE"
+  ]
 
 getMasterOrReplicaNode :: Shard -> [B.ByteString] -> Maybe String -> Maybe Bool -> IO Node
 getMasterOrReplicaNode (Shard master _) _ Nothing _ = return master
-getMasterOrReplicaNode (Shard master replicas) (cmd:_) (Just podZone) Nothing
-    | allHasZoneInfo (master : replicas) && cmd `elem` redisReadCommands = getRandomNode master replicas podZone
+getMasterOrReplicaNode (Shard master replicas) (cmd : _) (Just podZone) Nothing
+  | allHasZoneInfo (master : replicas) && cmd `elem` redisReadCommands = getRandomNode master replicas podZone
 getMasterOrReplicaNode (Shard master _) _ _ _ = return master
 
 allHasZoneInfo :: [Node] -> Bool
 allHasZoneInfo = all (\(Node _ _ _ _ zone) -> isJust zone)
 
 getRandomNode :: Node -> [Node] -> String -> IO Node
-getRandomNode master replicas podZone = 
-    let matchedZoneReplicas = filter (\(Node _ _ _ _ zone) -> Just podZone == zone) replicas
-    in if null matchedZoneReplicas 
+getRandomNode master replicas podZone =
+  let matchedZoneReplicas = filter (\(Node _ _ _ _ zone) -> Just podZone == zone) replicas
+   in if null matchedZoneReplicas
         then return master
         else (matchedZoneReplicas !!) <$> randomRIO (0, length matchedZoneReplicas - 1)
 
-
 allMasterNodes :: ShardMap -> NodeConnectionMap -> IO (Maybe [NodeConnection])
 allMasterNodes (ShardMap shardMap) nodeConns = do
-    return $ mapM (flip HM.lookup nodeConns) onlyMasterNodeIds
+  return $ mapM (flip HM.lookup nodeConns) onlyMasterNodeIds
   where
     onlyMasterNodeIds = nubOrd $ (\(Shard master _) -> nodeId master) <$> (IntMap.elems shardMap)
 
 requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
 requestNode (NodeConnection pool _) requests = withResource pool $ \(ctx, lastRecvRef) -> do
-    envTimeout <- round . (\x -> (x :: Time.NominalDiffTime) * 1000000) . realToFrac . fromMaybe (5 :: Double) . (>>= readMaybe) <$> lookupEnv "REDIS_REQUEST_NODE_TIMEOUT"
-    mayberesp <- timeout envTimeout $ requestNodeImpl ctx lastRecvRef
-    case mayberesp of
-      Just a    -> return a
-      Nothing   -> putStrLn "timeout happened" *> throwIO (TimeoutException "Request Timeout")
-    where
+  envTimeout <- round . (\x -> (x :: Time.NominalDiffTime) * 1000000) . realToFrac . fromMaybe (5 :: Double) . (>>= readMaybe) <$> lookupEnv "REDIS_REQUEST_NODE_TIMEOUT"
+  mayberesp <- timeout envTimeout $ requestNodeImpl ctx lastRecvRef
+  case mayberesp of
+    Just a -> return a
+    Nothing -> putStrLn "timeout happened" *> throwIO (TimeoutException "Request Timeout")
+  where
     requestNodeImpl :: CC.ConnectionContext -> IOR.IORef (Maybe B.ByteString) -> IO [Reply]
     requestNodeImpl ctx lastRecvRef = do
-        mapM_ (sendNode ctx . renderRequest) requests
-        _ <- CC.flush ctx
-        replicateM (length requests) $ recvNode ctx lastRecvRef
+      mapM_ (sendNode ctx . renderRequest) requests
+      _ <- CC.flush ctx
+      replicateM (length requests) $ recvNode ctx lastRecvRef
     sendNode :: CC.ConnectionContext -> B.ByteString -> IO ()
     sendNode = CC.send
     recvNode :: CC.ConnectionContext -> IOR.IORef (Maybe B.ByteString) -> IO Reply
     recvNode ctx lastRecvRef = do
-        maybeLastRecv <- IOR.readIORef lastRecvRef
-        scanResult <- case maybeLastRecv of
-            Just lastRecv -> Scanner.scanWith (CC.recv ctx) reply lastRecv
-            Nothing -> Scanner.scanWith (CC.recv ctx) reply B.empty
+      maybeLastRecv <- IOR.readIORef lastRecvRef
+      scanResult <- case maybeLastRecv of
+        Just lastRecv -> Scanner.scanWith (CC.recv ctx) reply lastRecv
+        Nothing -> Scanner.scanWith (CC.recv ctx) reply B.empty
 
-        case scanResult of
-            Scanner.Fail{}       -> CC.errConnClosed
-            Scanner.More{}    -> error "Hedis: parseWith returned Partial"
-            Scanner.Done rest' r -> do
-                IOR.writeIORef lastRecvRef (Just rest')
-                return r
+      case scanResult of
+        Scanner.Fail {} -> CC.errConnClosed
+        Scanner.More {} -> error "Hedis: parseWith returned Partial"
+        Scanner.Done rest' r -> do
+          IOR.writeIORef lastRecvRef (Just rest')
+          return r
 
 {-# INLINE nodes #-}
 nodes :: ShardMap -> [Node]
-nodes (ShardMap shardMap) = concatMap snd $ IntMap.toList $ fmap shardNodes shardMap where
+nodes (ShardMap shardMap) = concatMap snd $ IntMap.toList $ fmap shardNodes shardMap
+  where
     shardNodes :: Shard -> [Node]
-    shardNodes (Shard master slaves) = master:slaves
-
+    shardNodes (Shard master slaves) = master : slaves
 
 nodeWithHostAndPort :: ShardMap -> Host -> Port -> Maybe Node
 nodeWithHostAndPort shardMap host port = find (\(Node _ _ nodeHost nodePort _) -> port == nodePort && host == nodeHost) (nodes shardMap)
@@ -588,25 +610,24 @@ nodeId (Node theId _ _ _ _) = theId
 
 hasLocked :: IO a -> IO a
 hasLocked action =
-  action `catches`
-  [ Handler $ \exc@BlockedIndefinitelyOnMVar -> throwIO exc
-  ]
-
+  action
+    `catches` [ Handler $ \exc@BlockedIndefinitelyOnMVar -> throwIO exc
+              ]
 
 requestMasterNodes :: Connection -> [B.ByteString] -> IO [Reply]
 requestMasterNodes conn req = do
-    masterNodeConns <- masterNodes conn
-    concat <$> mapM (`requestNode` [req]) masterNodeConns
+  masterNodeConns <- masterNodes conn
+  concat <$> mapM (`requestNode` [req]) masterNodeConns
 
 masterNodes :: Connection -> IO [NodeConnection]
 masterNodes (Connection shardNodeVar _ _) = do
-    (ShardMap shardMap, nodeConns) <- hasLocked $ readMVar shardNodeVar
-    let masterNodeIds = map (\(Shard m _) -> nodeId m) $ IntMap.elems shardMap
-    return $ mapMaybe (`HM.lookup` nodeConns) (nubOrd masterNodeIds)
+  (ShardMap shardMap, nodeConns) <- hasLocked $ readMVar shardNodeVar
+  let masterNodeIds = map (\(Shard m _) -> nodeId m) $ IntMap.elems shardMap
+  return $ mapMaybe (`HM.lookup` nodeConns) (nubOrd masterNodeIds)
 
 getRandomConnection :: NodeConnection -> Connection -> IO NodeConnection
 getRandomConnection nc conn = do
   let (Connection shardNodeVar _ _) = conn
   (_, nodeConns) <- hasLocked $ readMVar shardNodeVar
   let conns = HM.elems nodeConns
-  return $ fromMaybe (head conns) $ find (nc /= ) conns
+  return $ fromMaybe (head conns) $ find (nc /=) conns

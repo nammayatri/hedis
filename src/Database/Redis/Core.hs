@@ -116,7 +116,7 @@ sendRequest :: (RedisCtx m f, RedisResult a)
 sendRequest req = do
     r' <- liftRedis $ Redis $ do
         env <- ask
-        podZone :: Maybe String <- (>>= readMaybe) <$> (liftIO $ lookupEnv "POD_ZONE")
+        podZone :: Maybe String <- liftIO $ lookupEnv "POD_ZONE"
         case env of
             NonClusteredEnv{..} -> do
                 r <- liftIO $ PP.request envConn (renderRequest req)

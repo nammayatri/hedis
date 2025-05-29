@@ -70,6 +70,8 @@ library
   exposed-modules:  Database.Redis
                   , Database.Redis.Sentinel
                   , Database.Redis.Core.Internal
+                  , Database.Redis.Cluster
+                  , Database.Redis.Connection
   build-depends:    scanner >= 0.2,
                     async >= 2.1,
                     base >= 4.8 && < 5,
@@ -98,8 +100,8 @@ library
       semigroups >= 0.11 && < 0.19
 
   other-modules:    Database.Redis.Core,
-                    Database.Redis.Connection,
-                    Database.Redis.Cluster,
+                    -- Database.Redis.Connection,
+                    -- Database.Redis.Cluster,
                     Database.Redis.Cluster.HashSlot,
                     Database.Redis.Cluster.Command,
                     Database.Redis.ProtocolPipelining,

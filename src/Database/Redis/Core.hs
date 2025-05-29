@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings, GeneralizedNewtypeDeriving, RecordWildCards,
     MultiParamTypeClasses, FunctionalDependencies, FlexibleInstances, CPP,
-    DeriveDataTypeable, StandaloneDeriving #-}
+    DeriveDataTypeable, StandaloneDeriving, ScopedTypeVariables #-}
 
 module Database.Redis.Core (
     Redis(), unRedis, reRedis,
@@ -25,6 +25,7 @@ import qualified Database.Redis.ProtocolPipelining as PP
 import Database.Redis.Types
 import Database.Redis.Cluster(ShardMap, NodeConnectionMap, NodeConnection)
 import qualified Database.Redis.Cluster as Cluster
+import System.Environment (lookupEnv)
 
 --------------------------------------------------------------------------------
 -- The Redis Monad
@@ -114,13 +115,14 @@ sendRequest :: (RedisCtx m f, RedisResult a)
 sendRequest req = do
     r' <- liftRedis $ Redis $ do
         env <- ask
+        podZone :: Maybe String <- liftIO $ lookupEnv "POD_ZONE"
         case env of
             NonClusteredEnv{..} -> do
                 r <- liftIO $ PP.request envConn (renderRequest req)
                 setLastReply r
                 return r
             ClusteredEnv{..} -> do
-                r <- liftIO $ Cluster.requestPipelined refreshAction connection req pipeline
+                r <- liftIO $ Cluster.requestPipelined refreshAction connection req pipeline podZone
                 lift (writeIORef clusteredLastReply r)
                 return r
     returnDecode r'

@@ -92,6 +92,10 @@ data ConnectInfo = ConnInfo
     --   get connected in this interval of time.
     , connectTLSParams      :: Maybe ClientParams
     -- ^ Optional TLS parameters. TLS will be enabled if this is provided.
+    , connectClusterName    :: Maybe String
+    -- ^ Optional label for this Redis cluster (e.g. "primary", "secondary").
+    --   When set, the label is included in timeout error messages so you can
+    --   quickly identify which cluster was being queried.
     } deriving Show
 
 data ConnectError = ConnectAuthError Reply
@@ -124,6 +128,7 @@ defaultConnectInfo = ConnInfo
     , connectMaxIdleTime    = 30
     , connectTimeout        = Nothing
     , connectTLSParams      = Nothing
+    , connectClusterName    = Nothing
     }
 
 defaultClusterConnectInfo :: ConnectInfo
@@ -137,6 +142,7 @@ defaultClusterConnectInfo = ConnInfo
     , connectMaxIdleTime    = 30
     , connectTimeout        = Nothing
     , connectTLSParams      = Nothing
+    , connectClusterName    = Nothing
     }
 
 createConnection :: ConnectInfo -> IO PP.Connection
@@ -221,7 +227,7 @@ instance Exception ClusterConnectError
 -- - MOVE, SELECT
 -- - PUBLISH, SUBSCRIBE, PSUBSCRIBE, UNSUBSCRIBE, PUNSUBSCRIBE, RESET
 connectCluster :: ConnectInfo -> IO Connection
-connectCluster bootstrapConnInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} = do
+connectCluster bootstrapConnInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime,connectClusterName} = do
     conn <- createConnection bootstrapConnInfo
     slotsResponse <- runRedisInternal conn clusterSlots
     shardMap <- case slotsResponse of
@@ -231,8 +237,8 @@ connectCluster bootstrapConnInfo@ConnInfo{connectMaxConnections,connectMaxIdleTi
     case commandInfos of
         Left e -> throwIO $ ClusterConnectError e
         Right infos -> do
-            let withAuth = connectWithAuth bootstrapConnInfo 
-            clusterConnection <- Cluster.createClusterConnectionPools withAuth connectMaxConnections connectMaxIdleTime infos shardMap
+            let withAuth = connectWithAuth bootstrapConnInfo
+            clusterConnection <- Cluster.createClusterConnectionPools withAuth connectMaxConnections connectMaxIdleTime connectClusterName infos shardMap
             return $ ClusteredConnection bootstrapConnInfo clusterConnection
 
 connectWithAuth :: ConnectInfo -> Cluster.Host -> CC.PortID -> IO CC.ConnectionContext

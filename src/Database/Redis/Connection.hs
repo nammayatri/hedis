@@ -203,7 +203,7 @@ withCheckedConnect connInfo = bracket (checkedConnect connInfo) disconnect
 --  while all connections from the pool are in use.
 runRedis :: Connection -> Redis a -> IO a
 runRedis (NonClusteredConnection pool) redis =
-  withResource pool $ \conn -> runRedisInternal conn redis
+  Cluster.withResourceTimed pool "non-clustered" $ \conn -> runRedisInternal conn redis
 runRedis (ClusteredConnection bootstrapConnInfo conn) redis =
     runRedisClusteredInternal conn (refreshShardMap bootstrapConnInfo conn) redis
 

@@ -29,6 +29,7 @@ module Database.Redis.Cluster
   , nodes
   , createNodePool
   , getZoneInfoFromSubnet
+  , withResourceTimed
 ) where
 
 import qualified Data.ByteString as B
@@ -40,10 +41,11 @@ import Data.List.Extra (nubOrd)
 import Data.Map(fromListWith, assocs)
 import Data.Function(on)
 import Control.Exception(Exception, SomeException, throwIO, BlockedIndefinitelyOnMVar(..), catches, Handler(..), try, fromException)
-import Data.Pool(Pool, createPool, withResource, destroyAllResources)
+import qualified Control.Exception as E
+import Data.Pool(Pool, createPool, destroyAllResources, takeResource, putResource, destroyResource)
 import System.Random (randomRIO)
 import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar)
-import Control.Monad(zipWithM, replicateM)
+import Control.Monad(zipWithM, replicateM, when)
 import Database.Redis.Cluster.HashSlot(HashSlot, keyToSlot)
 import qualified Database.Redis.ConnectionContext as CC
 import qualified Data.HashMap.Strict as HM
@@ -566,8 +568,23 @@ allMasterNodes (ShardMap shardMap) nodeConns = do
   where
     onlyMasterNodeIds = nubOrd $ (\(Shard master _) -> nodeId master) <$> (IntMap.elems shardMap)
 
+redisPoolAcquireWarnMillis :: Double
+redisPoolAcquireWarnMillis = 2000
+
+withResourceTimed :: Pool a -> String -> (a -> IO b) -> IO b
+withResourceTimed pool label act = E.mask $ \restore -> do
+  startedAt <- Time.getCurrentTime
+  (resource, localPool) <- restore (takeResource pool)
+  acquiredAt <- Time.getCurrentTime
+  let waitedMillis = realToFrac (Time.diffUTCTime acquiredAt startedAt) * 1000 :: Double
+  when (waitedMillis >= redisPoolAcquireWarnMillis) $
+    putStrLn ("REDIS_POOL_ACQUIRE: cannot get a connection from redis pool <" <> label <> "> : waited " <> show waitedMillis <> "ms")
+  result <- restore (act resource) `E.onException` destroyResource pool localPool resource
+  putResource localPool resource
+  pure result
+
 requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
-requestNode (NodeConnection pool _) requests = withResource pool $ \(ctx, lastRecvRef) -> do
+requestNode (NodeConnection pool nodeId') requests = withResourceTimed pool (Char8.unpack nodeId') $ \(ctx, lastRecvRef) -> do
   envTimeout <- round . (\x -> (x :: Time.NominalDiffTime) * 1000000) . realToFrac . fromMaybe (5 :: Double) . (>>= readMaybe) <$> lookupEnv "REDIS_REQUEST_NODE_TIMEOUT"
   mayberesp <- timeout envTimeout $ requestNodeImpl ctx lastRecvRef
   case mayberesp of

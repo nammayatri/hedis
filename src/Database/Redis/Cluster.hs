@@ -340,7 +340,16 @@ evaluatePipeline refreshShardmapAction conn@(Connection shardNodeVar infoMap _) 
                                 Left (err :: SomeException) ->
                                     case fromException err of
                                         Just (er :: TimeoutException) -> hasLocked $ refreshShardmapAction Nothing >> throwIO er
-                                        _ -> getRandomConnection nc conn >>= (`executeRequests` r)
+                                        -- A connection-level failure (e.g. ConnectTimeout) can mean the
+                                        -- node is gone from the cluster and our shard map is stale, in
+                                        -- which case retrying on a cached node can never succeed.
+                                        -- Refresh the shard map and re-route the requests, falling back
+                                        -- to the old retry-on-another-node behaviour if refresh fails.
+                                        _ -> do
+                                            refreshResult <- try $ hasLocked $ refreshShardmapAction Nothing
+                                            case refreshResult of
+                                                Right (newShardMap, newNodeConns) -> retryRequestsWithNewMap newShardMap newNodeConns r
+                                                Left (_ :: SomeException) -> getRandomConnection nc conn >>= (`executeRequests` r)
                 refreshedShardMapAndNodeConnsIORef <- IOR.newIORef Nothing
                 mapM (\completedRequest@(CompletedRequest index request response) -> 
                     case response of
@@ -369,6 +378,16 @@ evaluatePipeline refreshShardmapAction conn@(Connection shardNodeVar infoMap _) 
     executeRequests nodeConn nodeRequests = do
       replies <- requestNode nodeConn $ map rawRequest nodeRequests
       return $ zipWith (curry (\(PendingRequest i r, rep) -> CompletedRequest i r rep)) nodeRequests replies
+    retryRequestsWithNewMap :: ShardMap -> NodeConnectionMap -> [PendingRequest] -> IO [CompletedRequest]
+    retryRequestsWithNewMap newShardMap newNodeConns pendingRequests = do
+      commandsWithNodes <-
+        mapM
+          (\pending@(PendingRequest _ request) -> do
+              nodeConns <- nodeConnectionForCommand newShardMap newNodeConns infoMap request podZone useMasterOnly
+              return $ (,[pending]) <$> nodeConns)
+          pendingRequests
+      let requestsByNode = assocs $ fromListWith (++) (mconcat commandsWithNodes)
+      concat <$> mapM (uncurry executeRequests) requestsByNode
     refreshShardMapAndRetryRequest :: IOR.IORef (Maybe (ShardMap, NodeConnectionMap)) -> IO (ShardMap, NodeConnectionMap) -> [B.ByteString] -> IO Reply
     refreshShardMapAndRetryRequest refreshedShardMapAndNodeConnsIORef refreshShardmap request = do
       (newShardMap, newNodeConn) <-
@@ -404,7 +423,9 @@ evaluateTransactionPipeline refreshShardmapAction conn requests' = do
       case eresps of
         Right v -> return v
         Left (err :: SomeException) -> do
-            refreshedShardMapAndNodeConns <- hasLocked $ refreshShardmapAction (Just nodeConn)
+            -- The node itself may be unreachable (stale shard map), so don't
+            -- ask it for the refreshed topology.
+            refreshedShardMapAndNodeConns <- hasLocked $ refreshShardmapAction Nothing
             case fromException err of
                 Just (er :: TimeoutException) -> throwIO er
                 _ -> do

@@ -288,7 +288,15 @@ shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = do
 refreshShardMap :: ConnectInfo -> Cluster.Connection -> Maybe Cluster.NodeConnection -> IO (ShardMap, NodeConnectionMap)
 refreshShardMap connectInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} (Cluster.Connection shardNodeVar _ _) nodeConn = do
     modifyMVar shardNodeVar $ \(_, oldNodeConnMap) -> do
-        newShardMap <- refreshShardMapWithNodeConn nodeConn (HM.elems oldNodeConnMap)
+        newShardMap <-
+            refreshShardMapWithNodeConn nodeConn (HM.elems oldNodeConnMap)
+                `catch` \(err :: SomeException) -> do
+                    -- None of the cached node connections could serve CLUSTER SLOTS
+                    -- (e.g. the cluster was reprovisioned and every cached node is
+                    -- gone). Fall back to the bootstrap (discovery) endpoint, which
+                    -- resolves to a live node independently of the cached topology.
+                    print $ "ShardMapRefreshFallbackToBootstrap-" <> show err
+                    refreshShardMapWithBootstrap connectInfo
         newNodeConnMap <- updateNodeConnections newShardMap oldNodeConnMap        
         return ((newShardMap, newNodeConnMap), (newShardMap, newNodeConnMap))
     where
@@ -303,6 +311,16 @@ refreshShardMap connectInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} (
                         (_,nodeConnPool) <- Cluster.createNodePool withAuth connectMaxConnections connectMaxIdleTime node
                         return $ HM.insert nodeid nodeConnPool acc
                  ) HM.empty (nub $ Cluster.nodes newShardMap)
+
+refreshShardMapWithBootstrap :: ConnectInfo -> IO ShardMap
+refreshShardMapWithBootstrap bootstrapConnInfo =
+    bracket (createConnection bootstrapConnInfo) PP.disconnect $ \conn -> do
+        slotsResponse <- runRedisInternal conn clusterSlots
+        case slotsResponse of
+            Left e -> throwIO $ ClusterConnectError e
+            Right slots -> case clusterSlotsResponseEntries slots of
+                [] -> throwIO $ ClusterConnectError $ SingleLine "empty slotsResponse"
+                _ -> shardMapFromClusterSlotsResponse slots
 
 refreshShardMapWithNodeConn :: Maybe Cluster.NodeConnection -> [Cluster.NodeConnection] -> IO ShardMap
 refreshShardMapWithNodeConn _ [] = throwIO $ ClusterConnectError (Error "Couldn't refresh shardMap due to connection error")

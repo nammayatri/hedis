@@ -44,7 +44,7 @@ import Control.Exception(Exception, SomeException, throwIO, BlockedIndefinitelyO
 import qualified Control.Exception as E
 import Data.Pool(Pool, createPool, destroyAllResources, takeResource, putResource, destroyResource)
 import System.Random (randomRIO)
-import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar, modifyMVar_)
+import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar)
 import Control.Monad(zipWithM, replicateM, when)
 import Database.Redis.Cluster.HashSlot(HashSlot, keyToSlot)
 import qualified Database.Redis.ConnectionContext as CC
@@ -571,28 +571,10 @@ allMasterNodes (ShardMap shardMap) nodeConns = do
 redisPoolAcquireWarnMillis :: Double
 redisPoolAcquireWarnMillis = 2000
 
-isRedisPoolResetEnabled :: IO Bool
-isRedisPoolResetEnabled = maybe False (== "True") <$> lookupEnv "REDIS_POOL_RESET_ENABLED"
-
-getRedisPoolAcquireTimeoutMicros :: IO Int
-getRedisPoolAcquireTimeoutMicros =
+{-# NOINLINE redisPoolAcquireTimeoutMicros #-}
+redisPoolAcquireTimeoutMicros :: Int
+redisPoolAcquireTimeoutMicros = unsafePerformIO $
   round . (* (1000000 :: Double)) . fromMaybe 2 . (>>= readMaybe) <$> lookupEnv "REDIS_POOL_ACQUIRE_TIMEOUT"
-
-getRedisPoolResetThreshold :: IO Int
-getRedisPoolResetThreshold =
-  fromMaybe 3 . (>>= readMaybe) <$> lookupEnv "REDIS_POOL_RESET_THRESHOLD"
-
-{-# NOINLINE redisPoolAcquireFailureCounters #-}
-redisPoolAcquireFailureCounters :: MVar (HM.HashMap String Int)
-redisPoolAcquireFailureCounters = unsafePerformIO (newMVar HM.empty)
-
-bumpPoolFailureCount :: String -> IO Int
-bumpPoolFailureCount label = modifyMVar redisPoolAcquireFailureCounters $ \m ->
-  let newCount = HM.findWithDefault 0 label m + 1
-  in newCount `seq` pure (HM.insert label newCount m, newCount)
-
-clearPoolFailureCount :: String -> IO ()
-clearPoolFailureCount label = modifyMVar_ redisPoolAcquireFailureCounters (pure . HM.delete label)
 
 jsonStringField :: String -> String
 jsonStringField s = "\"" <> concatMap escapeChar s <> "\""
@@ -609,46 +591,35 @@ jsonStringField s = "\"" <> concatMap escapeChar s <> "\""
 jsonObject :: [(String, String)] -> String
 jsonObject fields = "{" <> intercalate "," (map (\(k, v) -> jsonStringField k <> ":" <> v) fields) <> "}"
 
-logRedisPoolAcquireEvent :: String -> String -> Double -> Maybe Int -> IO ()
-logRedisPoolAcquireEvent event label waitedMillis mFailureCount = do
+logRedisPoolAcquireEvent :: String -> String -> Double -> IO ()
+logRedisPoolAcquireEvent event label waitedMillis = do
   now <- Time.getCurrentTime
-  putStrLn $ jsonObject $
+  putStrLn $ jsonObject
     [ ("timestamp", jsonStringField (show now))
-    , ("lvl", jsonStringField (if event == "pool_acquire_timeout_reset" then "ERROR" else "WARNING"))
+    , ("lvl", jsonStringField "WARNING")
     , ("tag", jsonStringField "REDIS_POOL_ACQUIRE")
-    , ("msg", jsonObject $
+    , ("msg", jsonObject
         [ ("event", jsonStringField event)
         , ("pool", jsonStringField label)
         , ("waited_ms", show waitedMillis)
-        ] <> maybe [] (\c -> [("consecutive_failures", show c)]) mFailureCount)
+        ])
     ]
 
 withResourceTimed :: Pool a -> String -> (a -> IO b) -> IO b
 withResourceTimed pool label act = do
   startedAt <- Time.getCurrentTime
-  acquireTimeoutMicros <- getRedisPoolAcquireTimeoutMicros
-  mAcquired <- timeout acquireTimeoutMicros (takeResource pool)
+  mAcquired <- timeout redisPoolAcquireTimeoutMicros (takeResource pool)
   (resource, localPool) <- case mAcquired of
     Just acquired -> do
-      clearPoolFailureCount label
       acquiredAt <- Time.getCurrentTime
       let waitedMillis = realToFrac (Time.diffUTCTime acquiredAt startedAt) * 1000 :: Double
       when (waitedMillis >= redisPoolAcquireWarnMillis) $
-        logRedisPoolAcquireEvent "pool_acquire_slow" label waitedMillis Nothing
+        logRedisPoolAcquireEvent "pool_acquire_slow" label waitedMillis
       pure acquired
     Nothing -> do
       timedOutAt <- Time.getCurrentTime
       let waitedMillis = realToFrac (Time.diffUTCTime timedOutAt startedAt) * 1000 :: Double
-      failureCount <- bumpPoolFailureCount label
-      resetEnabled <- isRedisPoolResetEnabled
-      resetThreshold <- getRedisPoolResetThreshold
-      if resetEnabled && failureCount >= resetThreshold
-        then do
-          logRedisPoolAcquireEvent "pool_acquire_timeout_reset" label waitedMillis (Just failureCount)
-          destroyAllResources pool
-          clearPoolFailureCount label
-        else
-          logRedisPoolAcquireEvent "pool_acquire_timeout" label waitedMillis (Just failureCount)
+      logRedisPoolAcquireEvent "pool_acquire_timeout" label waitedMillis
       takeResource pool
   E.mask $ \restore -> do
     result <- restore (act resource) `E.onException` destroyResource pool localPool resource

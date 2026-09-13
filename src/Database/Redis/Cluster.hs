@@ -36,7 +36,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.IORef as IOR
 import Data.Maybe(mapMaybe, fromMaybe, isJust)
-import Data.List(sortBy, find, foldl')
+import Data.List(sortBy, find, foldl', intercalate)
 import Data.List.Extra (nubOrd)
 import Data.Map(fromListWith, assocs)
 import Data.Function(on)
@@ -119,7 +119,7 @@ type Host = String
 type Port = Int
 type NodeID = B.ByteString
 type Zone = Maybe String
--- Represents a single node, note that this type does not include the 
+-- Represents a single node, note that this type does not include the
 -- connection to the node because the shard map can be shared amongst multiple
 -- connections
 data Node = Node NodeID NodeRole Host Port Zone deriving (Show, Eq, Ord)
@@ -231,7 +231,7 @@ createClusterConnectionPools withAuth maxResources idleTime commandInfos shardMa
 
 createNodePool :: (Host -> CC.PortID -> IO CC.ConnectionContext) -> Int -> Time.NominalDiffTime -> Node -> IO (NodeID, NodeConnection)
 createNodePool withAuth maxResources idleTime (Node nodeid _ host port _zone) = do
-    connectionPool <- createPool (do 
+    connectionPool <- createPool (do
                                     connectionContext <- withAuth host (CC.PortNumber $ toEnum port)
                                     ref <- IOR.newIORef Nothing
                                     return (connectionContext,ref)) (CC.disconnect . fst) 1 idleTime maxResources
@@ -356,10 +356,10 @@ evaluatePipeline refreshShardmapAction conn@(Connection shardNodeVar infoMap _) 
                                         Just (er :: TimeoutException) -> hasLocked $ refreshShardmapAction Nothing >> throwIO er
                                         _ -> getRandomConnection nc conn >>= (`executeRequests` r)
                 refreshedShardMapAndNodeConnsIORef <- IOR.newIORef Nothing
-                mapM (\completedRequest@(CompletedRequest index request response) -> 
+                mapM (\completedRequest@(CompletedRequest index request response) ->
                     case response of
                         (Error errString) | (B.isPrefixOf "MOVED" errString || B.isPrefixOf "TRYAGAIN" errString) -> CompletedRequest index request <$> refreshShardMapAndRetryRequest refreshedShardMapAndNodeConnsIORef (hasLocked $ refreshShardmapAction (Just nc)) request
-                        (askingRedirection -> Just (host, port)) -> do 
+                        (askingRedirection -> Just (host, port)) -> do
                                 refreshedShardMapAndNodeConns <- fromMaybeM (hasLocked $ refreshShardmapAction (Just nc)) $ IOR.readIORef refreshedShardMapAndNodeConnsIORef
                                 maybeAskNode <- nodeConnWithHostAndPort refreshedShardMapAndNodeConns host port
                                 case maybeAskNode of
@@ -450,14 +450,14 @@ evaluateTransactionPipeline refreshShardmapAction conn requests' = do
     -- make arbitrary decisions about how long to paus before the retry and how
     -- often to retry, so instead we'll propagate the error to the library user
     -- and let them decide how they would like to handle the error.
-    loopM (\case 
+    loopM (\case
         heads:tails   -> if moved heads then do
                             refreshedShardMapAndNodeConns <- hasLocked $ refreshShardmapAction (Just nodeConn)
                             newNodeConn <- nodeConnForHashSlot refreshedShardMapAndNodeConns ("Error in evaluateTransactionPipeline moved retry" : head requests) hashSlot
                             Right <$> requestNode newNodeConn requests
-                        else 
+                        else
                             case askingRedirection heads of
-                                Just (host,port) -> do 
+                                Just (host,port) -> do
                                         refreshedShardMapAndNodeConns <- hasLocked $ refreshShardmapAction (Just nodeConn)
                                         maybeAskNode <- nodeConnWithHostAndPort refreshedShardMapAndNodeConns host port
                                         case maybeAskNode of
@@ -583,17 +583,60 @@ allMasterNodes (ShardMap shardMap) nodeConns = do
 redisPoolAcquireWarnMillis :: Double
 redisPoolAcquireWarnMillis = 2000
 
+{-# NOINLINE redisPoolAcquireTimeoutMicros #-}
+redisPoolAcquireTimeoutMicros :: Int
+redisPoolAcquireTimeoutMicros = unsafePerformIO $
+  round . (* (1000000 :: Double)) . fromMaybe 2 . (>>= readMaybe) <$> lookupEnv "REDIS_POOL_ACQUIRE_TIMEOUT"
+
+jsonStringField :: String -> String
+jsonStringField s = "\"" <> concatMap escapeChar s <> "\""
+  where
+    escapeChar '"' = "\\\""
+    escapeChar '\\' = "\\\\"
+    escapeChar '\n' = "\\n"
+    escapeChar '\r' = "\\r"
+    escapeChar '\t' = "\\t"
+    escapeChar c
+      | c < ' ' = ""
+      | otherwise = [c]
+
+jsonObject :: [(String, String)] -> String
+jsonObject fields = "{" <> intercalate "," (map (\(k, v) -> jsonStringField k <> ":" <> v) fields) <> "}"
+
+logRedisPoolAcquireEvent :: String -> String -> Double -> IO ()
+logRedisPoolAcquireEvent event label waitedMillis = do
+  now <- Time.getCurrentTime
+  putStrLn $ jsonObject
+    [ ("timestamp", jsonStringField (show now))
+    , ("lvl", jsonStringField "WARNING")
+    , ("tag", jsonStringField "REDIS_POOL_ACQUIRE")
+    , ("msg", jsonObject
+        [ ("event", jsonStringField event)
+        , ("pool", jsonStringField label)
+        , ("waited_ms", show waitedMillis)
+        ])
+    ]
+
 withResourceTimed :: Pool a -> String -> (a -> IO b) -> IO b
-withResourceTimed pool label act = E.mask $ \restore -> do
+withResourceTimed pool label act = do
   startedAt <- Time.getCurrentTime
-  (resource, localPool) <- restore (takeResource pool)
-  acquiredAt <- Time.getCurrentTime
-  let waitedMillis = realToFrac (Time.diffUTCTime acquiredAt startedAt) * 1000 :: Double
-  when (waitedMillis >= redisPoolAcquireWarnMillis) $
-    putStrLn ("REDIS_POOL_ACQUIRE: cannot get a connection from redis pool <" <> label <> "> : waited " <> show waitedMillis <> "ms")
-  result <- restore (act resource) `E.onException` destroyResource pool localPool resource
-  putResource localPool resource
-  pure result
+  mAcquired <- timeout redisPoolAcquireTimeoutMicros (takeResource pool)
+  (resource, localPool) <- case mAcquired of
+    Just acquired -> do
+      acquiredAt <- Time.getCurrentTime
+      let waitedMillis = realToFrac (Time.diffUTCTime acquiredAt startedAt) * 1000 :: Double
+      when (waitedMillis >= redisPoolAcquireWarnMillis) $
+        logRedisPoolAcquireEvent "pool_acquire_slow" label waitedMillis
+      pure acquired
+    Nothing -> do
+      timedOutAt <- Time.getCurrentTime
+      let waitedMillis = realToFrac (Time.diffUTCTime timedOutAt startedAt) * 1000 :: Double
+      logRedisPoolAcquireEvent "pool_acquire_timeout" label waitedMillis
+      takeResource pool
+  E.mask $ \restore -> do
+    result <- restore (act resource) `E.onException` destroyResource pool localPool resource
+    putResource localPool resource
+    pure result
 
 requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
 requestNode (NodeConnection pool nodeId') requests = withResourceTimed pool (Char8.unpack nodeId') $ \(ctx, lastRecvRef) -> do

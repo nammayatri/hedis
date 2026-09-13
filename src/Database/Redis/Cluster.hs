@@ -60,6 +60,8 @@ import           Data.Typeable
 import qualified Scanner
 import System.Environment (lookupEnv)
 import System.IO.Unsafe(unsafeInterleaveIO, unsafePerformIO)
+import Control.Concurrent.Async (mapConcurrently)
+import Data.Char (toLower)
 import Text.Read (readMaybe)
 import Control.Monad.Extra (loopM, fromMaybeM)
 import Database.Redis.Protocol(Reply(Error), renderRequest, reply)
@@ -304,6 +306,16 @@ responseIndex (CompletedRequest i _ _) = i
 rawResponse :: CompletedRequest -> Reply
 rawResponse (CompletedRequest _ _ r) = r
 
+parallelNodePipelineEnabled :: Bool
+parallelNodePipelineEnabled =
+  unsafePerformIO $ maybe False ((`elem` ["true", "1"]) . map toLower) <$> lookupEnv "REDIS_CLUSTER_PARALLEL_PIPELINE"
+{-# NOINLINE parallelNodePipelineEnabled #-}
+
+executeOnNodes :: (a -> IO b) -> [a] -> IO [b]
+executeOnNodes action nodeRequests@(_ : _ : _)
+  | parallelNodePipelineEnabled = mapConcurrently action nodeRequests
+executeOnNodes action nodeRequests = mapM action nodeRequests
+
 -- The approach we take here is similar to that taken by the redis-py-cluster
 -- library, which is described at https://redis-py-cluster.readthedocs.io/en/master/pipelines.html
 --
@@ -327,7 +339,7 @@ evaluatePipeline refreshShardmapAction conn@(Connection shardNodeVar infoMap _) 
         -- catch the exception thrown at each node level
         -- send the command to random node.
         -- merge the current responses with new responses.
-        eresps <- mapM (try . uncurry executeRequests) requestsByNode
+        eresps <- executeOnNodes (try . uncurry executeRequests) requestsByNode
         -- take a random connection where there are no exceptions.
         -- PERF_CONCERN: Since usually we send only one request at time, this won't be
         -- heavy perf issue. but still should be evaluated and figured out with complete rewrite.

@@ -398,10 +398,13 @@ evaluatePipeline refreshShardmapAction conn@(Connection shardNodeVar infoMap _) 
           mapM (\(resp, (nc, r)) -> do
                 responses <-  case resp of
                                 Right v -> return v
-                                Left (err :: SomeException) ->
-                                    case fromException err of
-                                        Just (er :: TimeoutException) -> hasLocked $ refreshShardmapAction Nothing >> throwIO er
-                                        _ -> getRandomConnection nc conn >>= (`executeRequests` r)
+                                Left (err :: SomeException)
+                                    | Just (er :: TimeoutException) <- fromException err -> hasLocked $ refreshShardmapAction Nothing >> throwIO er
+                                    -- No connection to the right node within the acquire timeout says
+                                    -- nothing about the topology: a random node would only answer
+                                    -- MOVED and a refresh would send us back to the same busy node.
+                                    | Just (er :: PoolAcquireTimeoutException) <- fromException err -> throwIO er
+                                    | otherwise -> getRandomConnection nc conn >>= (`executeRequests` r)
                 refreshedShardMapAndNodeConnsIORef <- IOR.newIORef Nothing
                 mapM (\completedRequest@(CompletedRequest index request response) ->
                     case response of
@@ -464,7 +467,10 @@ evaluateTransactionPipeline refreshShardmapAction conn requests' = do
     resps <-
       case eresps of
         Right v -> return v
-        Left (err :: SomeException) -> do
+        Left (err :: SomeException)
+          -- See evaluatePipeline: an acquire timeout is not a topology problem.
+          | Just (er :: PoolAcquireTimeoutException) <- fromException err -> throwIO er
+          | otherwise -> do
             refreshedShardMapAndNodeConns <- hasLocked $ refreshShardmapAction (Just nodeConn)
             case fromException err of
                 Just (er :: TimeoutException) -> throwIO er

@@ -145,7 +145,9 @@ type NodeConnectionMap = HM.HashMap NodeID NodeConnection
 -- Object for storing connection Info which will be used when cluster is refreshed
 data ClusterConfig = ClusterConfig
   { requestTimeout :: Maybe Int,
-    useMasterOnly :: Maybe Bool
+    useMasterOnly :: Maybe Bool,
+    -- | Serialises shard-map refreshes for this connection; see 'singleFlight'.
+    refreshGate :: RefreshGate
   }
   deriving (Show)
 
@@ -260,10 +262,12 @@ createClusterConnectionPools withAuth maxResources idleTime commandInfos shardMa
   nodeConns <- nodeConnections
   shardNodeVar <- newMVar (shardMap, nodeConns)
   nodeRequestTimeout <- (>>= readMaybe) <$> lookupEnv "REDIS_REQUEST_NODE_TIMEOUT"
+  gate <- newRefreshGate
   let clusterConfig =
         ClusterConfig
           { requestTimeout = nodeRequestTimeout,
-            useMasterOnly = Nothing
+            useMasterOnly = Nothing,
+            refreshGate = gate
           }
   return $ Connection shardNodeVar (CMD.newInfoMap commandInfos) clusterConfig
   where

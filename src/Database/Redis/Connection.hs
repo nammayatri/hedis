@@ -10,12 +10,12 @@ import qualified Control.Monad.Catch as Catch
 import Control.Monad.IO.Class(liftIO, MonadIO)
 import Control.Monad(when,foldM)
 
-import Control.Concurrent.MVar(modifyMVar)
+import Control.Concurrent.MVar(modifyMVar, readMVar)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as Char8
 import Data.Functor(void)
 import qualified Data.IntMap.Strict as IntMap
-import Data.Pool(Pool, withResource, createPool, destroyAllResources)
+import Data.Pool(Pool, createPool, destroyAllResources)
 import Data.Typeable
 import Data.List (nub)
 import qualified Data.Time as Time
@@ -286,11 +286,27 @@ shardMapFromClusterSlotsResponse ClusterSlotsResponse{..} = do
             Cluster.Node clusterSlotsNodeID role hostname (toEnum clusterSlotsNodePort) zone
 
 refreshShardMap :: ConnectInfo -> Cluster.Connection -> Maybe Cluster.NodeConnection -> IO (ShardMap, NodeConnectionMap)
-refreshShardMap connectInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} (Cluster.Connection shardNodeVar _ _) nodeConn = do
-    modifyMVar shardNodeVar $ \(_, oldNodeConnMap) -> do
-        newShardMap <- refreshShardMapWithNodeConn nodeConn (HM.elems oldNodeConnMap)
-        newNodeConnMap <- updateNodeConnections newShardMap oldNodeConnMap        
-        return ((newShardMap, newNodeConnMap), (newShardMap, newNodeConnMap))
+refreshShardMap connectInfo conn@(Cluster.Connection shardNodeVar _ _) nodeConn =
+    refreshShardMapWithFetch connectInfo conn $ do
+        (_, nodeConnMap) <- readMVar shardNodeVar
+        refreshShardMapWithNodeConn nodeConn (HM.elems nodeConnMap)
+
+-- | Refresh the shard map of a cluster connection from the 'ShardMap' the
+-- given fetch action returns.
+--
+-- The fetch (a CLUSTER SLOTS round trip in production) runs with no lock
+-- held, so commands keep reading the current shard map while it is in
+-- flight; the map is only locked for the merge of the result, which needs
+-- no I/O because node pools open their connections lazily. Refreshes are
+-- serialised through the connection's 'Cluster.RefreshGate', so callers that
+-- ask while a fetch is in flight wait for that fetch and reuse its result.
+refreshShardMapWithFetch :: ConnectInfo -> Cluster.Connection -> IO ShardMap -> IO (ShardMap, NodeConnectionMap)
+refreshShardMapWithFetch connectInfo@ConnInfo{connectMaxConnections,connectMaxIdleTime} (Cluster.Connection shardNodeVar _ clusterConfig) fetch =
+    Cluster.singleFlight (Cluster.refreshGate clusterConfig) (readMVar shardNodeVar) $ do
+        newShardMap <- fetch
+        modifyMVar shardNodeVar $ \(_, oldNodeConnMap) -> do
+            newNodeConnMap <- updateNodeConnections newShardMap oldNodeConnMap
+            return ((newShardMap, newNodeConnMap), (newShardMap, newNodeConnMap))
     where
         withAuth :: Cluster.Host -> CC.PortID -> IO CC.ConnectionContext
         withAuth = connectWithAuth connectInfo
@@ -310,21 +326,23 @@ refreshShardMapWithNodeConn maybeNodeConn nodeConnsList = do
     let numOfNodes = length nodeConnsList
     selectedIdx <- randomRIO (0, length nodeConnsList - 1)
     let (Cluster.NodeConnection pool _) = fromMaybe (nodeConnsList !! selectedIdx) maybeNodeConn
-    eresp <- try $ refreshShardMapWithPool pool
-    case eresp of 
+    eresp <- trySync $ refreshShardMapWithPool pool
+    case eresp of
         Left  (_::SomeException) ->  do                 -- retry on other node
             let otherSelectedIdx                        = (selectedIdx + 1) `mod` numOfNodes
-                (Cluster.NodeConnection otherPool _)    = maybe (nodeConnsList !! otherSelectedIdx) 
-                                                                (\nc -> if nc /= nodeConnsList !! selectedIdx then nodeConnsList !! selectedIdx else nodeConnsList !! otherSelectedIdx) 
+                (Cluster.NodeConnection otherPool _)    = maybe (nodeConnsList !! otherSelectedIdx)
+                                                                (\nc -> if nc /= nodeConnsList !! selectedIdx then nodeConnsList !! selectedIdx else nodeConnsList !! otherSelectedIdx)
                                                                 (maybeNodeConn)
             refreshShardMapWithPool otherPool
         Right shardMap -> return shardMap
-    where 
-        refreshShardMapWithPool pool = withResource pool $ 
+    where
+        -- The acquire is bounded: a node whose every connection is busy must
+        -- not stall the refresh, and with it every caller waiting on it.
+        refreshShardMapWithPool pool = Cluster.withResourceTimed pool "cluster-slots" $
                 \(ctx,_) -> do
                     pipelineConn <- PP.fromCtx ctx
                     envTimeout <- fromMaybe (10 ^ (5 :: Int)) . (>>= readMaybe) <$> lookupEnv "REDIS_CLUSTER_SLOTS_TIMEOUT"
-                    eresp <- T.timeout envTimeout (try $ refreshShardMapWithConn pipelineConn True) -- racing with delay of default 100 ms 
+                    eresp <- T.timeout envTimeout (trySync $ refreshShardMapWithConn pipelineConn True) -- racing with delay of default 100 ms
                     case eresp of
                         Nothing -> do
                             print $ "TimeoutForConnection " <> show ctx 
@@ -335,6 +353,15 @@ refreshShardMapWithNodeConn maybeNodeConn nodeConnsList = do
                                 Left (err :: SomeException) -> do
                                     print $ "ShardMapRefreshError-" <> show err 
                                     throwIO $ ClusterConnectError (Error $ Char8.pack ("Couldn't refresh shardMap due to error - " <> show err))
+
+-- | 'try' for synchronous exceptions only. Asynchronous ones (a request
+-- timeout cancelling the caller, a thread being killed) pass through, so a
+-- refresh that is stuck cannot swallow its own cancellation and block again.
+trySync :: IO a -> IO (Either SomeException a)
+trySync action = (Right <$> action) `catch` \e ->
+    case fromException e of
+        Just (SomeAsyncException _) -> throwIO e
+        Nothing -> return (Left e)
 
 refreshShardMapWithConn :: PP.Connection -> Bool -> IO ShardMap
 refreshShardMapWithConn pipelineConn _ = do

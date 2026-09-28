@@ -18,6 +18,7 @@ module Database.Redis.Cluster
   , HashSlot
   , Shard(..)
   , TimeoutException(..)
+  , PoolAcquireTimeoutException(..)
   , NodeID
   , Pipeline(..)
   , PipelineState(..)
@@ -33,6 +34,7 @@ module Database.Redis.Cluster
   , createNodePool
   , getZoneInfoFromSubnet
   , withResourceTimed
+  , withResourceTimedMicros
 ) where
 
 import qualified Data.ByteString as B
@@ -196,6 +198,14 @@ instance Exception NoNodeException
 data TimeoutException = TimeoutException String deriving (Show, Typeable)
 
 instance Exception TimeoutException
+
+-- | Thrown when no connection to a node could be taken from its pool within
+-- the acquire timeout ('REDIS_POOL_ACQUIRE_TIMEOUT', default 2 s). Unlike
+-- 'TimeoutException' this says nothing about cluster topology, so it must
+-- not trigger a shard-map refresh.
+newtype PoolAcquireTimeoutException = PoolAcquireTimeoutException String deriving (Show, Typeable)
+
+instance Exception PoolAcquireTimeoutException
 
 -- format: `127.0.0.0/24`
 -- Note: '/' is mandatory to determine mask.
@@ -651,25 +661,34 @@ logRedisPoolAcquireEvent event label waitedMillis = do
     ]
 
 withResourceTimed :: Pool a -> String -> (a -> IO b) -> IO b
-withResourceTimed pool label act = do
+withResourceTimed = withResourceTimedMicros redisPoolAcquireTimeoutMicros
+
+-- | Like 'Data.Pool.withResource', but gives up with
+-- 'PoolAcquireTimeoutException' when no resource can be taken within the
+-- given number of microseconds.
+--
+-- The acquire runs with asynchronous exceptions masked. 'takeResource' stays
+-- interruptible while it blocks, so the timeout still cuts a long wait short,
+-- but once the pool has handed over a resource the timeout can no longer land
+-- in between and drop that resource on the floor, which would shrink the pool
+-- by one for good.
+withResourceTimedMicros :: Int -> Pool a -> String -> (a -> IO b) -> IO b
+withResourceTimedMicros acquireTimeoutMicros pool label act = E.mask $ \restore -> do
   startedAt <- Time.getCurrentTime
-  mAcquired <- timeout redisPoolAcquireTimeoutMicros (takeResource pool)
+  mAcquired <- timeout acquireTimeoutMicros (takeResource pool)
+  finishedAt <- Time.getCurrentTime
+  let waitedMillis = realToFrac (Time.diffUTCTime finishedAt startedAt) * 1000 :: Double
   (resource, localPool) <- case mAcquired of
     Just acquired -> do
-      acquiredAt <- Time.getCurrentTime
-      let waitedMillis = realToFrac (Time.diffUTCTime acquiredAt startedAt) * 1000 :: Double
       when (waitedMillis >= redisPoolAcquireWarnMillis) $
         logRedisPoolAcquireEvent "pool_acquire_slow" label waitedMillis
       pure acquired
     Nothing -> do
-      timedOutAt <- Time.getCurrentTime
-      let waitedMillis = realToFrac (Time.diffUTCTime timedOutAt startedAt) * 1000 :: Double
       logRedisPoolAcquireEvent "pool_acquire_timeout" label waitedMillis
-      takeResource pool
-  E.mask $ \restore -> do
-    result <- restore (act resource) `E.onException` destroyResource pool localPool resource
-    putResource localPool resource
-    pure result
+      throwIO $ PoolAcquireTimeoutException label
+  result <- restore (act resource) `E.onException` destroyResource pool localPool resource
+  putResource localPool resource
+  pure result
 
 requestNode :: NodeConnection -> [[B.ByteString]] -> IO [Reply]
 requestNode (NodeConnection pool nodeId') requests = withResourceTimed pool (Char8.unpack nodeId') $ \(ctx, lastRecvRef) -> do

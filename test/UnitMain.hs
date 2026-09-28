@@ -11,6 +11,8 @@ import Data.IORef
 import qualified Test.Framework as Test
 import qualified Test.Framework.Providers.HUnit as Test (testCase)
 import Test.HUnit ((@?=), assertBool)
+import Data.Pool (newPool, defaultPoolConfig, setNumStripes, withResource)
+import Data.Time.Clock (getCurrentTime, diffUTCTime)
 
 import qualified Database.Redis.Cluster as Cluster
 
@@ -19,7 +21,53 @@ main = Test.defaultMain
     [ testSingleFlightSharesOneRefresh
     , testSingleFlightRefreshesAgainAfterCompletion
     , testSingleFlightFailureDoesNotPoisonGate
+    , testAcquireFailsFastWhenPoolExhausted
+    , testAcquireTimeoutLeaksNoCapacity
     ]
+
+------------------------------------------------------------------------------
+-- withResourceTimedMicros
+--
+
+-- With every resource of the pool held elsewhere, a timed acquire must throw
+-- PoolAcquireTimeoutException once the timeout elapses, not wait forever.
+testAcquireFailsFastWhenPoolExhausted :: Test.Test
+testAcquireFailsFastWhenPoolExhausted = Test.testCase "withResourceTimedMicros: throws PoolAcquireTimeoutException when the pool is exhausted" $ do
+    pool <- newPool $ setNumStripes (Just 1) $ defaultPoolConfig (return ()) (\_ -> return ()) 30 1
+    release <- newEmptyMVar
+    holder <- async $ withResource pool $ \_ -> takeMVar release
+    threadDelay 50000 -- let the holder take the only resource
+    started <- getCurrentTime
+    result <- try (Cluster.withResourceTimedMicros 200000 pool "test-pool" (\_ -> return "acquired"))
+    elapsed <- (`diffUTCTime` started) <$> getCurrentTime
+    putMVar release ()
+    wait holder
+    case result of
+        Left (Cluster.PoolAcquireTimeoutException _) -> return ()
+        Right v -> assertBool ("expected PoolAcquireTimeoutException, got " ++ show v) False
+    assertBool ("acquire did not fail promptly: " ++ show elapsed) (elapsed < 1)
+
+-- After acquires have timed out, the pool must still hand out its resource
+-- once it is released: a timeout must never lose the resource it raced.
+testAcquireTimeoutLeaksNoCapacity :: Test.Test
+testAcquireTimeoutLeaksNoCapacity = Test.testCase "withResourceTimedMicros: timed-out acquires leak no pool capacity" $ do
+    created <- newIORef (0 :: Int)
+    pool <- newPool $ setNumStripes (Just 1) $ defaultPoolConfig (atomicModifyIORef' created (\n -> (n + 1, ()))) (\_ -> return ()) 30 1
+    release <- newEmptyMVar
+    holder <- async $ withResource pool $ \_ -> takeMVar release
+    threadDelay 50000
+    replicateM_ 5 $ do
+        r <- try (Cluster.withResourceTimedMicros 20000 pool "test-pool" (\_ -> return ()))
+        case r of
+            Left (Cluster.PoolAcquireTimeoutException _) -> return ()
+            Right () -> assertBool "acquire should have timed out" False
+    putMVar release ()
+    wait holder
+    started <- getCurrentTime
+    Cluster.withResourceTimedMicros 200000 pool "test-pool" (\_ -> return ())
+    elapsed <- (`diffUTCTime` started) <$> getCurrentTime
+    assertBool ("acquire after release was slow: " ++ show elapsed) (elapsed < 0.1)
+    readIORef created >>= (@?= 1)
 
 ------------------------------------------------------------------------------
 -- singleFlight

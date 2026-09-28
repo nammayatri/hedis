@@ -208,6 +208,8 @@ test-suite hedis-test-unit
         hedis,
         HUnit,
         async,
+        resource-pool,
+        time,
         test-framework,
         test-framework-hunit
     ghc-options: -O0 -Wall -threaded -rtsopts

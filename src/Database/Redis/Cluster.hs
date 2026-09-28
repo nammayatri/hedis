@@ -22,6 +22,9 @@ module Database.Redis.Cluster
   , Pipeline(..)
   , PipelineState(..)
   , ClusterConfig(..)
+  , RefreshGate
+  , newRefreshGate
+  , singleFlight
   , createClusterConnectionPools
   , destroyNodeResources
   , requestPipelined
@@ -44,7 +47,7 @@ import Control.Exception(Exception, SomeException, throwIO, BlockedIndefinitelyO
 import qualified Control.Exception as E
 import Data.Pool(Pool, createPool, destroyAllResources, takeResource, putResource, destroyResource)
 import System.Random (randomRIO)
-import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar)
+import Control.Concurrent.MVar(MVar, newMVar, readMVar, modifyMVar, withMVar)
 import Control.Monad(zipWithM, replicateM, when)
 import Database.Redis.Cluster.HashSlot(HashSlot, keyToSlot)
 import qualified Database.Redis.ConnectionContext as CC
@@ -143,6 +146,36 @@ data ClusterConfig = ClusterConfig
     useMasterOnly :: Maybe Bool
   }
   deriving (Show)
+
+-- | Serialises shard-map refreshes. A refresh is triggered by every MOVED,
+-- ASK, TRYAGAIN and timeout, so during a reshard many threads ask for one at
+-- once. The gate makes callers that arrive while a refresh is in flight wait
+-- for that refresh and reuse its result, instead of each running its own
+-- CLUSTER SLOTS round trip one after another.
+data RefreshGate = RefreshGate (MVar ()) (IOR.IORef Int)
+
+instance Show RefreshGate where
+    show _ = "RefreshGate"
+
+newRefreshGate :: IO RefreshGate
+newRefreshGate = RefreshGate <$> newMVar () <*> IOR.newIORef 0
+
+-- | @singleFlight gate reuse refresh@ runs @refresh@ unless another caller
+-- completed a refresh between this call starting and it acquiring the gate,
+-- in which case @reuse@ (typically: read the current shard map) is run
+-- instead. A refresh that throws does not advance the gate, so the next
+-- caller makes its own attempt.
+singleFlight :: RefreshGate -> IO a -> IO a -> IO a
+singleFlight (RefreshGate lock generation) reuse refresh = do
+    seen <- IOR.readIORef generation
+    withMVar lock $ \() -> do
+        current <- IOR.readIORef generation
+        if current /= seen
+            then reuse
+            else do
+                result <- refresh
+                IOR.atomicModifyIORef' generation (\g -> (g + 1, ()))
+                return result
 
 newtype MissingNodeException = MissingNodeException [B.ByteString] deriving (Show, Typeable)
 

@@ -12,3 +12,4 @@ Main.hs
 TAGS
 stack*.yaml.lock
 .vscode
+.direnv/

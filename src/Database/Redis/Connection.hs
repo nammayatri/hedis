@@ -180,7 +180,8 @@ connect cInfo@ConnInfo{..} = NonClusteredConnection <$>
 checkedConnect :: ConnectInfo -> IO Connection
 checkedConnect connInfo = do
     conn <- connect connInfo
-    runRedis conn $ void ping
+    bracket (createConnection connInfo) PP.disconnect $ \direct ->
+        runRedisInternal direct (void ping)
     return conn
 
 -- |Destroy all idle resources in the pool.

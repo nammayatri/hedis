@@ -1,3 +1,4 @@
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -72,6 +73,7 @@ import Control.Monad.Extra (loopM, fromMaybeM)
 import Database.Redis.Protocol(Reply(Error), renderRequest, reply)
 import qualified Database.Redis.Cluster.Command as CMD
 import System.Timeout (timeout)
+import Control.Concurrent (threadDelay)
 
 -- This module implements a clustered connection whilst maintaining
 -- compatibility with the original Hedis codebase. In particular it still
@@ -670,6 +672,66 @@ logRedisPoolAcquireEvent event label waitedMillis = do
         ])
     ]
 
+data RedisConnectRetryPolicy = RedisConnectRetryPolicy
+  { rcrMaxAttempts :: Int
+  , rcrDelayMicros :: Int
+  , rcrMaxDelayMicros :: Int
+  }
+
+{-# NOINLINE redisConnectRetryPolicy #-}
+redisConnectRetryPolicy :: Maybe RedisConnectRetryPolicy
+redisConnectRetryPolicy = unsafePerformIO $ do
+  enabled <- maybe False ((== "true") . map toLower) <$> lookupEnv "CONNECT_RETRY_ENABLED"
+  if enabled
+    then do
+      attempts <- fromMaybe 3 . (>>= readMaybe) <$> lookupEnv "CONNECT_RETRY_RUNTIME_MAX_ATTEMPTS"
+      delayMs <- fromMaybe 50 . (>>= readMaybe) <$> lookupEnv "CONNECT_RETRY_RUNTIME_DELAY_MS"
+      maxDelayMs <- fromMaybe 500 . (>>= readMaybe) <$> lookupEnv "CONNECT_RETRY_RUNTIME_MAX_DELAY_MS"
+      pure $ Just RedisConnectRetryPolicy
+        { rcrMaxAttempts = max 1 attempts
+        , rcrDelayMicros = max 0 delayMs * 1000
+        , rcrMaxDelayMicros = max 0 maxDelayMs * 1000
+        }
+    else pure Nothing
+
+-- | Retries only when opening a connection for the pool fails, i.e. before any
+-- command has been sent, so repeating it can never apply a command twice.
+acquireWithConnectRetry :: (forall x. IO x -> IO x) -> String -> IO a -> IO a
+acquireWithConnectRetry restore label acquire = go 1
+  where
+    go attempt = do
+      r <- try acquire
+      case r of
+        Right a -> pure a
+        Left (err :: SomeException)
+          | Just (_ :: E.SomeAsyncException) <- fromException err -> throwIO err
+          | Just (_ :: PoolAcquireTimeoutException) <- fromException err -> throwIO err
+          | Just policy <- redisConnectRetryPolicy -> do
+              let isLast = attempt >= rcrMaxAttempts policy
+              logRedisConnectRetryEvent (if isLast then "ERROR" else "WARNING") (if isLast then "connect_failed" else "connect_retry") label attempt (rcrMaxAttempts policy) (show err)
+              if isLast
+                then throwIO err
+                else do
+                  restore $ threadDelay (min (rcrMaxDelayMicros policy) (rcrDelayMicros policy * 2 ^ min 20 (attempt - 1)))
+                  go (attempt + 1)
+          | otherwise -> throwIO err
+
+logRedisConnectRetryEvent :: String -> String -> String -> Int -> Int -> String -> IO ()
+logRedisConnectRetryEvent lvl event label attempt maxAttempts errMsg = do
+  now <- Time.getCurrentTime
+  putStrLn $ jsonObject
+    [ ("timestamp", jsonStringField (show now))
+    , ("lvl", jsonStringField lvl)
+    , ("tag", jsonStringField "CONNECT_RETRY")
+    , ("msg", jsonObject
+        [ ("event", jsonStringField event)
+        , ("target", jsonStringField ("redis pool " <> label))
+        , ("attempt", show attempt)
+        , ("max_attempts", show maxAttempts)
+        , ("error", jsonStringField errMsg)
+        ])
+    ]
+
 withResourceTimed :: Pool a -> String -> (a -> IO b) -> IO b
 withResourceTimed = withResourceTimedMicros redisPoolAcquireTimeoutMicros
 
@@ -685,7 +747,7 @@ withResourceTimed = withResourceTimedMicros redisPoolAcquireTimeoutMicros
 withResourceTimedMicros :: Int -> Pool a -> String -> (a -> IO b) -> IO b
 withResourceTimedMicros acquireTimeoutMicros pool label act = E.mask $ \restore -> do
   startedAt <- Time.getCurrentTime
-  mAcquired <- timeout acquireTimeoutMicros (takeResource pool)
+  mAcquired <- acquireWithConnectRetry restore label (timeout acquireTimeoutMicros (takeResource pool))
   finishedAt <- Time.getCurrentTime
   let waitedMillis = realToFrac (Time.diffUTCTime finishedAt startedAt) * 1000 :: Double
   (resource, localPool) <- case mAcquired of
